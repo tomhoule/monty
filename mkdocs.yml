@@ -34,6 +34,7 @@ nav:
       - Host Objects: 'host-objects.md'
       - Resource Limits: 'resource-limits.md'
       - Filesystem Access: 'filesystem.md'
+      - Temporary Files / tempfile: 'temporary-storage.md'
       - Snapshots: 'snapshots.md'
       - Type Checking: 'type-checking.md'
   - Reference:
@@ -80,6 +81,7 @@ nav:
       - random: 'limitations/random.md'
       - re: 'limitations/re.md'
       - sys: 'limitations/sys.md'
+      - tempfile: 'limitations/tempfile.md'
       - time: 'limitations/time.md'
       - tomllib: 'limitations/tomllib.md'
       - unicodedata: 'limitations/unicodedata.md'
