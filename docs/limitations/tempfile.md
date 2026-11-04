@@ -2,14 +2,14 @@
 
 !!! note "Not implemented"
 
-    The `tempfile` module and the `TempStorage` SDK helper are not implemented.
+    The `tempfile` module is not implemented.
 
-`TemporaryDirectory`, `mkdtemp`, `gettempdir` and `gettempprefix` are available.
+`TemporaryDirectory`, `NamedTemporaryFile`, `mkdtemp`, `gettempdir` and `gettempprefix` are available.
 Use [temporary storage](../temporary-storage.md) to supply a filesystem and save it alongside interpreter state.
 
 ## Unsupported functions
 
-`NamedTemporaryFile`, `TemporaryFile`, `mkstemp`, `SpooledTemporaryFile`, `mktemp`, `gettempdirb` and `gettempprefixb`
+`TemporaryFile`, `mkstemp`, `SpooledTemporaryFile`, `mktemp`, `gettempdirb` and `gettempprefixb`
 are absent from the module.
 The module has no writable `tempdir` setting.
 Use `dir=` to select another directory.
@@ -20,13 +20,22 @@ Another caller can create that path before it is used, so Monty excludes the fun
 
 ### `NamedTemporaryFile`
 
-`NamedTemporaryFile` is not implemented, even with a mode other than its default `w+b`.
-That default creates a binary file for both reading and writing.
+`NamedTemporaryFile` requires an explicit write or append mode: `w`, `wb`, `a` or `ab`.
+Equivalent mode spellings follow `open()` normalization.
+Omitting `mode`, or explicitly passing the default `w+b`, raises
+`ValueError: update modes ('+') are not yet supported`.
+Read-only modes are outside this first implementation.
+
 Monty's [file objects](open.md#mode-strings) reject read/write update modes.
 Reads use a cached buffer, while writes replace or append whole-file content.
 They do not support overwriting bytes at the current seek position and keeping the read buffer consistent afterward.
-Create an ordinary file inside `TemporaryDirectory` instead.
-Its file operations follow the existing `open()` and `pathlib` limitations.
+An explicit write mode supports writing a file, closing it, and passing its `.name` to another operation.
+Host tools must translate that virtual path through the configured storage.
+
+Deletion on close or context exit requires interpreter execution and can raise filesystem errors.
+There is no automatic deletion when the file object becomes unreachable or the worker terminates.
+Use `delete=False` when the file must remain after closing, and remove it explicitly afterward.
+See [named temporary files](../temporary-storage.md#using-named-temporary-files) for deletion options.
 
 ### Descriptors and spooling
 
@@ -52,9 +61,14 @@ Monty keeps the default fixed and accepts per-call `dir=` arguments instead.
 Importing the module does not grant filesystem access.
 Creating a directory without an accessible filesystem raises `PermissionError`.
 
-Temporary directory creation and cleanup support only the SDK's `TempStorage` filesystem.
-`dir=` must resolve to `/tmp` or a directory below it in that storage; other locations raise `ValueError`.
-A disk-backed mount at `/tmp` does not provide `tempfile` support.
+Temporary files use host-configured filesystem access, including disk-backed mounts.
+`dir=` can select a directory in any suitable writable mount; `/tmp` has no special storage backend.
+The host must explicitly provide storage at `/tmp` to use the default location.
+There is no automatic fallback, SDK `TempStorage` helper or new filesystem serialization format.
+Read-only mounts reject creation, and default overlay mounts discard writes at the end of each feed.
+Use a read-write mount for files that must survive across feeds.
+Recursive cleanup must respect symlinks and nested mount boundaries; mounting a directory does not grant permission to
+remove files outside it.
 
 Bytes paths raise `TypeError`.
 Prefixes and suffixes containing `/` or a null byte raise `ValueError`.
@@ -74,7 +88,7 @@ It follows the session's `random_start` policy:
 - `call_host` requests 2,496 bytes through `os.urandom`.
     A reply of the wrong type or length raises `RuntimeError`, as for `random` initialization.
 
-Calling `random.seed()` does not reset temporary naming, and creating temporary directories does not change the other
+Calling `random.seed()` does not reset temporary naming, and creating temporary files or directories does not change the other
 random streams.
 The private state persists across imports, feeds and interpreter dumps.
 An import or `gettempdir()` call does not initialize it.
@@ -112,6 +126,8 @@ The host must dispose of storage whose interpreter never resumes.
 
 An interpreter dump retains temporary directory objects and pending cleanup, but does not contain host filesystem
 contents.
-Save the matching files through [checkpoint and restore](../temporary-storage.md#checkpoint-and-restore).
-Temporary files survive successive feeds when the host supplies the same storage.
+Retain or save the matching backing storage separately, then reattach it when restoring.
+See [checkpoint and restore](../temporary-storage.md#checkpoint-and-restore).
+Combined interpreter and filesystem checkpointing is outside this feature.
+Temporary files survive successive feeds when the host supplies the same read-write storage.
 Existing per-feed overlays discard writes and do not provide that lifetime.

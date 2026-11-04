@@ -2,22 +2,26 @@
 
 !!! note "Not implemented"
 
-    The `tempfile` module and the `TempStorage` SDK helper are not implemented.
+    The `tempfile` module is not implemented.
+    The mounts and interpreter snapshot APIs used below already exist.
 
-Python's `tempfile` module creates scratch directories for files used during execution.
+Python's `tempfile` module creates scratch files and directories in storage supplied by the host.
 Use `TemporaryDirectory` to remove a directory when a `with` block exits, or `mkdtemp` to keep it until you delete it.
-Files inside these directories work with `open()` and `pathlib`.
-`NamedTemporaryFile` is not supported.
-Create an ordinary file inside `TemporaryDirectory` instead.
-See the [read/write-mode limitation](limitations/tempfile.md#namedtemporaryfile).
-Anonymous files and spooling are also [not supported](limitations/tempfile.md#unsupported-functions).
+Use `NamedTemporaryFile` with an explicit mode to create a file with a pathname and cleanup on close or context exit.
+Files inside temporary directories work with `open()` and `pathlib`.
+Anonymous files and spooling are [not supported](limitations/tempfile.md#unsupported-functions).
 
-The host supplies storage before running sandboxed code.
+## Supplying storage
+
+Temporary files use the same [filesystem mounts](filesystem.md#mounts) as ordinary files.
+There is no new SDK storage helper, storage dump format or automatic filesystem fallback.
 No temporary storage is available by default.
-The Python SDK's `TempStorage` provides a private, in-memory filesystem at `/tmp`:
+Mount a private host directory at `/tmp`, or use `dir=` to select a directory in another writable mount.
 
 ```python test="skip"
-from pydantic_monty import Monty, TempStorage
+import tempfile
+
+from pydantic_monty import Monty, MountDir
 
 code = """
 import tempfile
@@ -31,14 +35,38 @@ with tempfile.TemporaryDirectory() as directory:
 text
 """
 
-with TempStorage() as storage, Monty() as pool:
-    with pool.checkout() as session:
-        print(session.feed_run(code, os=storage))
-        #> total: 42
+with tempfile.TemporaryDirectory() as host_directory:
+    with (
+        MountDir(
+            host_path=host_directory, virtual_path='/tmp', mode='read-write'
+        ) as scratch,
+        Monty() as pool,
+    ):
+        with pool.checkout() as session:
+            print(session.feed_run(code, mount=scratch))
+            #> total: 42
 ```
 
-The sandbox's `with` block removes the temporary directory and its contents.
-The host's `with TempStorage()` block closes the storage and releases any remaining files.
+The outer `tempfile` is host Python's module and creates the backing directory.
+The sandbox's `with` block removes its temporary directory and contents.
+The host's `with` block removes the backing directory and anything left in it.
+Mounting a private directory at `/tmp` does not expose the host's shared temporary directory.
+Sandbox paths are virtual POSIX paths on every host platform.
+
+Pass a list to `mount=` to combine scratch storage with application mounts, for example `mount=[data, scratch]`.
+Mounts must have distinct virtual paths and disjoint host directories.
+A separate scratch mount lets the host choose where temporary files are written without changing application storage.
+A path such as `/tmp/report.txt` is a sandbox path; host tools need an explicit mapping to the backing storage.
+
+Use `mode='read-write'` when files must survive successive snippets.
+The default mount mode, `overlay`, discards writes when a feed ends.
+A read-only mount rejects creation.
+Without a mount or an OS callback that handles the operation, creation raises `PermissionError`.
+The interpreter does not search for another writable location or create storage automatically.
+
+Mount write limits and memory limits follow the existing [mount options](filesystem.md#options).
+The write budget applies per feed; it is not a quota on all retained files.
+The host manages disk capacity and eventual disposal of the backing directory.
 
 ## Using temporary directories
 
@@ -57,9 +85,12 @@ Both functions return absolute virtual paths, including when `dir` is relative.
 | `dir`    | `None`  | Parent directory as a string or `pathlib.Path`; `None` uses `/tmp` |
 
 Each name contains eight random lowercase letters, digits or underscores between the prefix and suffix.
-The host creates the directory exclusively with mode `0o700`, without first checking whether it exists.
-Creation tries up to 20 candidate names, then raises `FileExistsError` if all already exist.
+Creation reserves each candidate exclusively, without first checking whether it exists.
+Directory creation requests mode `0o700`; named-file creation requests `0o600`, subject to the backing filesystem.
+It tries up to 20 candidate names, then raises `FileExistsError` if all already exist.
 Other filesystem errors propagate immediately.
+Creating temporary directories and files requires exclusive creation even though ordinary `open(..., 'x')` remains
+unsupported.
 See [path restrictions](limitations/tempfile.md#paths-and-directory-selection) and
 [random state](limitations/tempfile.md#independent-random-state).
 
@@ -71,161 +102,90 @@ See [path restrictions](limitations/tempfile.md#paths-and-directory-selection) a
     It does not suppress resource limits or exceptions from the body of the `with` block.
 
 Calling `.cleanup()` repeatedly succeeds if the directory is already absent.
-Cleanup stays within `TempStorage`, which contains no symlinks or nested mounts.
+Cleanup must respect mount confinement and must not follow symlinks outside the temporary directory.
 See [cleanup limitations](limitations/tempfile.md#cleanup-requires-execution) for permission errors and paused execution.
 
-## Configuring storage
+## Using named temporary files
 
-`TempStorage` takes keyword-only arguments:
+Pass an explicit `mode` to `NamedTemporaryFile`.
+The supported modes are `w`, `wb`, `a` and `ab`, including equivalent spellings accepted by `open()`.
+The default `w+b` raises `ValueError` because Monty does not support read/write update modes.
+Use `w` for text or `wb` for bytes:
 
-| Argument               | Default      | Meaning                                                 |
-| ---------------------- | ------------ | ------------------------------------------------------- |
-| `max_total_file_bytes` | `50_000_000` | Maximum combined size of file contents, in bytes        |
-| `max_entries`          | `10_000`     | Maximum number of files and directories below `/tmp`    |
-| `fallback`             | `None`       | An `os` callback for operations outside this filesystem |
+```python test="skip"
+import tempfile
 
-Limits are non-negative integers and cannot be disabled.
-Wrong argument types raise `TypeError` at construction.
-Negative limits raise `ValueError`.
-An operation that exceeds either limit raises `OSError` in the sandbox before changing the filesystem.
-Paths longer than 4,096 UTF-8 bytes, including `/tmp`, raise `OSError`.
-Deleting files releases their quota.
-The worker's memory limit is separate because these files occupy host memory.
+from pydantic_monty import Monty, MountDir
 
-The storage contains only directories and regular files.
-It does not create host files, follow symlinks or expose the host's shared temporary directory.
-Paths are virtual POSIX paths on every host platform.
-Files have mode `0o600` and directories have mode `0o700`, regardless of a requested creation mode.
-`stat()` reports zero timestamps.
+code = """
+import tempfile
+from pathlib import Path
 
-Pass the storage as `os=storage`.
-It handles filesystem calls under `/tmp`, including `open()` and `pathlib` operations.
-Missing files under `/tmp` raise the corresponding filesystem error without consulting `fallback`.
-Other calls go to `fallback`, or return `NOT_HANDLED` when no fallback is configured.
-This includes environment queries and host entropy requests.
-Storage dumps do not contain the fallback callback.
+with tempfile.NamedTemporaryFile(mode='w', delete=False) as report:
+    report.write('total: 42')
+    name = report.name
 
-You can combine `TempStorage` with mounts outside `/tmp`.
-A mount at `/tmp`, above it, or below it is rejected before execution so it cannot shadow the storage.
-`tempfile` directory creation and cleanup require `TempStorage`.
-Disk-backed mounts do not support these operations, including when mounted at `/tmp`.
-Use [filesystem mounts](filesystem.md#mounts) for ordinary file I/O outside the temporary filesystem.
-`TempStorage` has no disk backend.
+text = Path(name).read_text()
+Path(name).unlink()
+text
+"""
+
+with tempfile.TemporaryDirectory() as host_directory:
+    with (
+        MountDir(
+            host_path=host_directory, virtual_path='/tmp', mode='read-write'
+        ) as scratch,
+        Monty() as pool,
+    ):
+        with pool.checkout() as session:
+            print(session.feed_run(code, mount=scratch))
+            #> total: 42
+```
+
+The file exposes its absolute virtual pathname as `.name` and uses the existing file I/O implementation.
+It reserves a new name exclusively; selecting an append mode does not open an existing candidate.
+`suffix`, `prefix` and `dir` follow the directory creation rules above.
+Other file options follow the existing [open() restrictions](limitations/open.md#open-arguments).
+
+With the default `delete=True, delete_on_close=True`, closing the file removes it.
+With `delete=True, delete_on_close=False`, closing the file keeps it until context exit.
+With `delete=False`, the caller removes the file and `delete_on_close` has no effect.
+There is no finalizer cleanup.
+See [named-file limitations](limitations/tempfile.md#namedtemporaryfile).
 
 ## Reusing files across snippets
 
 A feed is one submitted snippet, such as `session.feed_run()` or `session.feed_start()`.
-Temporary files survive the end of a feed.
-Pass the same storage to each feed that uses them:
+Supply the mount on every feed that needs the files.
+With a read-write mount, files remain in the backing directory after a feed or session ends, until explicitly deleted.
+Closing a mount does not delete the directory.
+A host `TemporaryDirectory` context does delete it when the context exits.
 
-```python test="skip"
-from pydantic_monty import Monty, TempStorage
-
-with TempStorage() as storage, Monty() as pool:
-    with pool.checkout() as session:
-        session.feed_run(
-            "import tempfile\nfrom pathlib import Path\n"
-            "directory = tempfile.mkdtemp()\n"
-            "report = Path(directory) / 'report.txt'\n"
-            "report.write_text('total: 42')",
-            os=storage,
-        )
-        print(session.feed_run('report.read_text()', os=storage))
-        #> total: 42
-```
-
-`feed_start` retains the handler throughout a suspended feed, so `resume_auto()` uses the same storage.
-An explicit `resume(...)` supplies the result directly and bypasses the handler, as for other OS callbacks.
-Storage does not attach itself to later feeds.
-Omitting `os=storage` leaves filesystem calls to the other handlers supplied for that feed.
-
-A `TempStorage` object can be attached to only one live session at a time.
-Using it from another session raises `RuntimeError` until the first session closes.
-Closing the session detaches the storage and keeps its files.
-Existing overlay mounts discard writes when a feed ends.
-
-## Saving files separately
-
-`storage.dump()` returns opaque bytes containing the files and directories below `/tmp`.
-`TempStorage.load(data, *, max_total_file_bytes=50_000_000, max_entries=10_000, fallback=None)` returns new storage.
-Load enforces the limits you pass, regardless of the limits used when saving.
-Every load creates an independent writable copy.
-
-Storage dumps preserve paths, file bytes and directory structure, including empty directories.
-They contain no host paths, callbacks or session attachment.
-They use a versioned format without compression or pickle.
-Dump and load reject payloads larger than 256 MiB with `ValueError`.
-Load also rejects duplicate paths, traversal, paths outside `/tmp`, unsupported entry types and quota violations with
-`ValueError` before exposing any files.
-
-You can dump storage between feeds or while the interpreter is suspended, provided no host callback is running.
-Dumping or closing storage during a running feed or callback raises `RuntimeError`.
-A storage dump does not contain interpreter state.
-The caller must pair that data with the matching interpreter dump.
+`feed_start` retains the mounts throughout a suspended feed, so `resume_auto()` uses the same mounts.
+An explicit `resume(...)` supplies the result directly and bypasses automatic filesystem handling.
+Later feeds still require `mount=`.
 
 ## Checkpoint and restore
 
-Interpreter state and temporary files have separate dump/load APIs.
-There is no combined checkpoint operation.
-Take both dumps while the session is idle or suspended, with no host callback or filesystem operation running.
-Do not resume execution or modify the files between dumps.
+Interpreter dumps do not include mounted files.
+There is no combined checkpoint API or filesystem export/import API in this feature.
+To restore temporary files, retain the backing directory or save its contents using your host storage system.
+Reattach the matching storage when restoring the interpreter.
+Temporary files still needed by the program must remain available after restoration.
 
-```python test="skip"
-from pydantic_monty import Monty, TempStorage
+Capture interpreter state and files while the session is idle or suspended, with no host callback or filesystem operation
+running.
+Do not resume execution or modify the files between captures.
+Save them as a matching pair so a failed save cannot pair new interpreter state with old files.
+An interpreter dump alone does not make disk files durable or copy them to another host.
 
-with TempStorage() as storage, Monty() as pool:
-    with pool.checkout() as session:
-        session.feed_run(
-            "import tempfile\nfrom pathlib import Path\n"
-            "directory = tempfile.mkdtemp()\n"
-            "report = Path(directory) / 'report.txt'\n"
-            "report.write_text('total: 42')",
-            os=storage,
-        )
-        interpreter_state = session.dump()
-        storage_state = storage.dump()
+Between feeds, use `session.dump()` and `session.load_session(data)`, then supply the mounts on the next feed.
+For suspended execution, use `snapshot.dump()` and restore with `session.load_snapshot(data, mount=scratch)`.
+The restored snapshot's `resume_auto()` uses that mount.
+See [interpreter snapshots](snapshots.md#storing-and-restoring) for the complete restore API and snapshot trust contract.
+Combined interpreter and filesystem checkpointing is deferred.
 
-# The original interpreter and storage have closed.
-# Save both dumps together to resume in another process.
-
-with TempStorage.load(storage_state) as storage, Monty() as pool:
-    with pool.checkout() as session:
-        session.load_session(interpreter_state)
-        print(session.feed_run('report.read_text()', os=storage))
-        #> total: 42
-```
-
-For suspended execution, use `snapshot.dump()` instead of `session.dump()`.
-Restore the storage first, then call `session.load_snapshot(interpreter_state, os=storage)` on a fresh session.
-The restored snapshot's `resume_auto()` uses that storage.
-Later feeds still require `os=storage`.
-See [interpreter snapshots](snapshots.md#storing-and-restoring) for answering the paused call.
-
-Use a `with` block for the loaded storage so it closes even if interpreter loading fails.
-Restoration preserves virtual paths and creates an independent writable copy of the files.
-Storage dumps contain no other mounts or files outside `/tmp`.
-After restoring interpreter state, supply live host objects and callbacks again.
-See [host objects and snapshots](host-objects.md#snapshots).
-Neither dump captures external side effects outside the temporary filesystem.
-Only load interpreter state from a trusted, compatible producer under the existing
-[snapshot trust contract](snapshots.md#snapshot-trust).
-
-Save the two dumps as a matching pair.
-Use your storage system's transaction or atomic replacement mechanism so a failed save cannot pair new interpreter
-state with old files.
-The dump methods return bytes and do not perform durable writes.
-
-## Closing storage
-
-`storage.close()` releases all files and is idempotent.
-Other calls using closed storage raise `RuntimeError`.
-Closing a paused session's storage does not run Python cleanup.
-The session can no longer access those files on resume.
-Keep the storage open while a session still needs it, or save both dumps before closing it.
-See [cleanup limitations](limitations/tempfile.md#cleanup-requires-execution).
-
-The helper is part of the Python SDK.
-Its `os` handler works with local sync and async sessions, and with remote sessions whose filesystem calls are
-serviced by the client.
-There is no JavaScript helper.
-All execution paths save storage separately from interpreter state.
+The host owns the backing storage's lifetime independently of the interpreter.
+Do not let a host `TemporaryDirectory` context exit if you intend to restore from its files later, unless you have saved
+them elsewhere first.
+A paused or terminated interpreter cannot run Python cleanup; the host must dispose of abandoned storage.
